@@ -437,6 +437,11 @@ class Archive:
                 continue
             try:
                 self._compact(shard, day)
+            except Fenced:
+                # the flush itself committed, so only later work is refused
+                with self._lock:
+                    self._fenced = True
+                return
             except OSError as error:
                 print(f"{self.node_id}: compaction failed, will retry: {error!r}", flush=True)
 

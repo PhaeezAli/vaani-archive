@@ -6,7 +6,6 @@ The work directory is kept and printed, so the real WAL objects, segments and ma
 opened under store/. Exit code 0 only if every check passed, else 1 with one FAILED line per
 failed check. A harness failure raises RuntimeError with the server's log tail.
 """
-import fcntl
 import os
 import shutil
 import statistics
@@ -17,36 +16,45 @@ import tracemalloc
 from pathlib import Path
 
 from archive.codec import encode_segment
+from archive.store import LocalStore
 from tests.scenarios import kill_scenario
 from tests.workload import DAY0, station_day_rows
 
 PUT_BYTES = 8 * 1024            # about one WAL object of 300 readings
 MEMTABLE_BYTES = 64 * 2**20     # the doc's memtable cap
 
-def _sync(fd: int, full_sync: bool) -> None:
-    if full_sync:
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
-
-def put_latency_ms(full_sync: bool, n: int = 40) -> float:
-    """Median of n write-and-sync cycles of 8 KB on its own temp files: F_FULLFSYNC on the file
-    and the directory, or plain os.fsync."""
+def _median_ms(step, n: int) -> float:
     folder = tempfile.mkdtemp(prefix="archive-sync-")
-    data = os.urandom(PUT_BYTES)
     times = []
     for i in range(n):
         started = time.perf_counter()
-        fd = os.open(os.path.join(folder, f"put-{i}"), os.O_WRONLY | os.O_CREAT, 0o644)
-        os.write(fd, data)
-        _sync(fd, full_sync)
-        os.close(fd)
-        folder_fd = os.open(folder, os.O_RDONLY)
-        _sync(folder_fd, full_sync)
-        os.close(folder_fd)
+        step(folder, i)
         times.append(time.perf_counter() - started)
     shutil.rmtree(folder)
     return statistics.median(times) * 1000
+
+def store_put_ms(n: int = 40) -> float:
+    """Median of n LocalStore puts of 8 KB with If-None-Match, each to a new key: the real put,
+    with F_FULLFSYNC on macOS."""
+    data = os.urandom(PUT_BYTES)
+    return _median_ms(lambda folder, i: LocalStore(folder).put(f"put-{i}", data,
+                                                               if_none_match=True), n)
+
+def plain_fsync_ms(n: int = 40) -> float:
+    """Median of n cycles of writing 8 KB to a new file and calling plain os.fsync on the file
+    and the directory. Not durable on macOS, so this is only the comparison."""
+    data = os.urandom(PUT_BYTES)
+
+    def step(folder: str, i: int) -> None:
+        fd = os.open(os.path.join(folder, f"put-{i}"), os.O_WRONLY | os.O_CREAT, 0o644)
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        folder_fd = os.open(folder, os.O_RDONLY)
+        os.fsync(folder_fd)
+        os.close(folder_fd)
+
+    return _median_ms(step, n)
 
 def memtable_row_bytes(n: int = 200_000) -> float:
     """tracemalloc bytes per row for the memtable's real layout: dict station -> list of 7-int Row
@@ -80,10 +88,10 @@ def _table(header: tuple, rows: list[tuple]) -> None:
 def _measurements() -> list[tuple[str, str]]:
     row_bytes = memtable_row_bytes()
     sizes = segment_sizes()
-    full = f"{put_latency_ms(True):.1f} ms" if hasattr(fcntl, "F_FULLFSYNC") else "n/a"
     return [
-        ("durable 8 KB put with F_FULLFSYNC, median of 40", full),
-        ("durable 8 KB put with plain fsync, median of 40", f"{put_latency_ms(False):.1f} ms"),
+        ("8 KB LocalStore put (F_FULLFSYNC on macOS), median of 40", f"{store_put_ms():.1f} ms"),
+        ("8 KB write and plain fsync (not durable on macOS), median of 40",
+         f"{plain_fsync_ms():.1f} ms"),
         (f"CPython bytes per memtable row (64 MB is {MEMTABLE_BYTES // round(row_bytes):,} rows)",
          f"{row_bytes:.0f}"),
         ("segment bytes per reading, v2, every column", f"{sizes['v2']:.2f}"),

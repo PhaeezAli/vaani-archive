@@ -246,12 +246,14 @@ def get_stats(url: str) -> dict:
     """GET /stats."""
     return _get(f"{url}/stats")
 
-def _wal_tail_rows(store: LocalStore, watermark: int) -> int:
-    rows = 0
+def _wal_tail(store: LocalStore, watermark: int) -> tuple[int, int]:
+    """(objects, rows) in the WAL above the watermark."""
+    objects = rows = 0
     for key in store.list("wal/"):
         if int(key[4:]) > watermark:
+            objects += 1
             rows += len(decode_wal(store.get(key)[0], key)[3])
-    return rows
+    return objects, rows
 
 def _oracle_of(batches: list[list[Reading]], indexes: Iterable[int]) -> Oracle:
     oracle = Oracle()
@@ -306,7 +308,7 @@ def _run_kill_scenario(work: Path, servers: list[ServerProcess]) -> dict:
     store = LocalStore(work / "store")
     stored, _ = manifest.read(store)
     watermark = stored["wal_watermark"]
-    tail_rows = _wal_tail_rows(store, watermark)
+    tail_objects, tail_rows = _wal_tail(store, watermark)
     segments = len(stored["segments"])
     unknown = len(sender.unknown)
     decisive = (acked_at_kill >= 1 and outstanding_at_kill >= 1 and unknown >= 1 and segments >= 1
@@ -320,7 +322,7 @@ def _run_kill_scenario(work: Path, servers: list[ServerProcess]) -> dict:
     stats2 = get_stats(url)
     second = check(history, _oracle_of(batches, range(len(batches))), exact=True)
     group = (stats2["batches"] - stats1["batches"]) / (stats2["wal_puts"] - stats1["wal_puts"])
-    doubled = first["doubled"] + second["doubled"]
+    replayed = stats1["replayed_wal_objects"]
     second_ok = not any(second[name] for name in ("missing", "extra", "wrong", "doubled"))
     checks = [
         ("kill run was decisive", f"{acked_at_kill} acked, {outstanding_at_kill} outstanding, "
@@ -328,13 +330,14 @@ def _run_kill_scenario(work: Path, servers: list[ServerProcess]) -> dict:
         ("acknowledged readings missing right after restart",
          f"{first['missing']:,} of {first['readings']:,}, {first['wrong']} keys behind",
          first["missing"] == 0 and first["wrong"] == 0),
-        ("acknowledged readings returned twice", f"{doubled}", doubled == 0),
+        # raw replay count, because history collapses identical rows before check sees them
+        ("WAL tail objects replayed exactly once", f"{replayed} of {tail_objects}",
+         replayed == tail_objects),
         ("stations matching the dict oracle after resends",
          f"{second['stations_ok']} of {second['stations']}", second_ok),
         ("batches per WAL put, 8 clients, 200 ms window", f"{group:.1f}", group >= 2)]
     info = [
         ("requests outstanding at the kill", f"{outstanding_at_kill}"),
-        ("WAL objects replayed after the kill", f"{stats1['replayed_wal_objects']}"),
         ("readings sent including resends and corrections",
          f"{sender.sent_rows + resender.sent_rows:,}"),
         ("server peak RSS after the restart and resends", f"{stats2['peak_rss_mb']:.0f} MB")]

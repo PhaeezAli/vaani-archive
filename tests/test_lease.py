@@ -1,12 +1,13 @@
-"""Tests 8 to 10: the lease boundary, the CAS retry, and a writer replaced in the middle of a put.
-Tests 8 and 9 call the manifest with integer clocks. Test 10 runs two Archives on one store."""
+"""Tests 8 to 10 and 10b: the lease boundary, the CAS retry, a writer replaced in the middle of a
+put, and a writer replaced during compaction. Tests 8 and 9 call the manifest with integer clocks.
+Tests 10 and 10b run Archives on one store."""
 import threading
 
 import pytest
 
 from archive import manifest
 from archive.archive import wal_key
-from archive.codec import CHANNEL, VALUE, decode_wal
+from archive.codec import CHANNEL, SEQ, VALUE, decode_wal
 from archive.manifest import LEASE_SECONDS, Fenced, LeaseHeld, acquire, commit, renew
 from archive.store import LocalStore
 from tests.doubles import CallbackStore, Clock, GatedStore
@@ -109,3 +110,32 @@ def test_a_writer_replaced_mid_put_never_acknowledges_and_loses_nothing(open_arc
     fresh = open_archive(LocalStore(root), "b", now=later)
     assert fresh.history(7, t, t + 1) == latest
     assert fresh.history(7, t, t + 1, all_versions=True) == every
+    # after a flush the WAL tail is empty, so only the manifest carries ingest_seq forward
+    fresh.flush()
+    fresh.close()
+    again = open_archive(LocalStore(root), "b", now=later)
+    _, seq = again.ingest([(7, 0, t, 0, 99)])   # a same-revision overwrite
+    assert seq > max(row[SEQ] for row in every)
+    assert {row[CHANNEL]: row[VALUE] for row in again.history(7, t, t + 1)} == {0: 99, 1: 10}
+
+def test_a_lease_lost_during_auto_compaction_fences_the_writer(open_archive, tmp_path):
+    """Doc section 4: a writer replaced while it compacts stops serving once it notices."""
+    root = tmp_path / "store"
+    t = DAY0 * 86_400
+    armed = []
+    # the takeover lands when the second flush lists the WAL to delete it, before compaction
+    store = CallbackStore(root, lambda: armed and acquire(LocalStore(root), "b", 2000),
+                          on_list="wal/")
+    a = open_archive(store, compact_at_segments=2)
+    a.ingest([(7, 0, t, 0, 5)])
+    a.flush()
+    armed.append(True)
+    store.done = False
+    a.ingest([(7, 0, t + 60, 0, 6)])
+    a.flush()   # the flush committed before the takeover, so it succeeds
+    assert manifest.read(LocalStore(root))[0]["lease_holder"] == "b"
+    assert (a.stats()["fenced"], a.stats()["stopped"]) == (True, None)
+    with pytest.raises(Fenced):
+        a.history(7, t, t + 120)
+    with pytest.raises(Fenced):
+        a.ingest([(7, 0, t + 120, 0, 7)])
