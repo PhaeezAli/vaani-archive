@@ -14,6 +14,7 @@ import itertools
 import struct
 import zlib
 from collections.abc import Iterable, Iterator
+from operator import itemgetter
 
 from archive.store import ObjectStore
 
@@ -37,6 +38,14 @@ SEGMENT_READ_VERSIONS = (1, 2)      # readers read N and N-1 (doc section 6)
 ZLIB_LEVEL = 6                      # the level the experiment used
 GRID_TOLERANCE = 1e-6               # a value within a millionth of a step of the grid is on it
 MICROS = 1_000_000                  # STEPS are in millionths of the unit
+# Byte layouts from spec section 4, all little-endian. The WAL row is Reading in the same order.
+WAL_HEADER = struct.Struct("<4sBQQQI")    # magic, version, token, first_seq, commit_time, count
+WAL_ROW = struct.Struct("<IBqIq")         # station, channel, event_time, revision, value: 25 bytes
+WAL_CRC = struct.Struct("<I")             # crc32 of every byte before it, at the very end
+WAL_MIN_BYTES = WAL_HEADER.size + WAL_CRC.size   # 37, the size of a fence object
+SEGMENT_HEADER = struct.Struct("<4sBBIB")  # magic, version, shard, day, n_channels: 11 bytes
+INDEX_ENTRY = struct.Struct("<III")       # station, offset from the object start, block length
+FOOTER = struct.Struct("<IIII4s")         # header_len, index_offset, n_stations, meta_crc, magic
 
 class CorruptObject(Exception):
     """Length, magic or CRC check failed, or a listed object is missing. These are not the bytes
@@ -62,43 +71,138 @@ def unquantise(channel: int, steps: int) -> float:
     return round(steps * STEPS[channel] / MICROS, 6)
 
 def _put_uvarint(out: bytearray, n: int) -> None:
-    raise NotImplementedError
+    # LEB128: 7 bits per byte, low bits first, high bit set on every byte except the last
+    while n >= 0x80:
+        out.append(n & 0x7F | 0x80)
+        n >>= 7
+    out.append(n)
 
 def _get_uvarint(data: bytes, pos: int) -> tuple[int, int]:
-    raise NotImplementedError
+    n = 0
+    shift = 0
+    while data[pos] & 0x80:
+        n |= (data[pos] & 0x7F) << shift
+        shift += 7
+        pos += 1
+    return n | data[pos] << shift, pos + 1
 
 def _zigzag(n: int) -> int:
-    raise NotImplementedError
+    # an explicit branch, because Python ints are unbounded and the 64-bit xor trick needs a width
+    if n >= 0:
+        return 2 * n
+    return -2 * n - 1
 
 def _unzigzag(z: int) -> int:
-    raise NotImplementedError
+    if z % 2 == 0:
+        return z // 2
+    return -(z + 1) // 2
 
 def _deltas(xs: list[int]) -> list[int]:
-    raise NotImplementedError
+    # the first delta is taken against 0, so the first value is stored as is
+    return xs[:1] + [b - a for a, b in zip(xs, xs[1:])]
 
 def _undeltas(ds: list[int]) -> list[int]:
-    raise NotImplementedError
+    return list(itertools.accumulate(ds))
 
 def encode_wal(token: int, first_seq: int, commit_time: int, readings: list[Reading]) -> bytes:
     """One WAL object. Reading i gets ingest_seq first_seq + i. An empty list is a fence object."""
-    raise NotImplementedError
+    out = bytearray(WAL_HEADER.pack(WAL_MAGIC, WAL_VERSION, token, first_seq, commit_time,
+                                    len(readings)))
+    for reading in readings:
+        out += WAL_ROW.pack(*reading)
+    out += WAL_CRC.pack(zlib.crc32(out))
+    return bytes(out)
 
 def decode_wal(data: bytes, key: str) -> tuple[int, int, int, list[Row]]:
     """Return (token, first_seq, commit_time, rows) with ingest_seq and ingest_time filled in.
     CorruptObject or UnsupportedFormat."""
-    raise NotImplementedError
+    if len(data) < WAL_MIN_BYTES:
+        raise CorruptObject(f"{key}: {len(data)} bytes is shorter than a WAL header")
+    magic, version, token, first_seq, commit_time, count = WAL_HEADER.unpack_from(data)
+    if magic != WAL_MAGIC:
+        raise CorruptObject(f"{key}: bad WAL magic {magic!r}")
+    # the CRC comes from the last 4 bytes, so a damaged count is caught before anyone trusts it
+    if zlib.crc32(data[:-WAL_CRC.size]) != WAL_CRC.unpack_from(data, len(data) - WAL_CRC.size)[0]:
+        raise CorruptObject(f"{key}: WAL CRC mismatch")
+    if version not in WAL_READ_VERSIONS:
+        raise UnsupportedFormat(f"{key}: WAL version {version} is not in {WAL_READ_VERSIONS}")
+    if len(data) != WAL_MIN_BYTES + WAL_ROW.size * count:
+        raise CorruptObject(f"{key}: {len(data)} bytes does not fit a WAL of {count} rows")
+    body = data[WAL_HEADER.size:-WAL_CRC.size]
+    rows = [(station, channel, t, revision, first_seq + i, commit_time, value)
+            for i, (station, channel, t, revision, value) in enumerate(WAL_ROW.iter_unpack(body))]
+    return token, first_seq, commit_time, rows
 
 def _encode_block(rows: list[Row], version: int) -> bytes:
-    raise NotImplementedError
+    out = bytearray()
+    for channel, run in itertools.groupby(rows, key=itemgetter(CHANNEL)):
+        run = list(run)
+        _put_uvarint(out, channel)
+        _put_uvarint(out, len(run))
+        d = _deltas([row[TIME] for row in run])
+        # delta of delta: a clean cadence becomes t0, step, 0, 0, ... and each 0 is one byte
+        columns = [d[:1] + _deltas(d[1:])]
+        columns += [_deltas([row[field] for row in run]) for field in (REVISION, SEQ, INGEST_TIME)]
+        if version >= 2:
+            columns.append(_deltas([row[VALUE] for row in run]))
+        for column in columns:
+            for n in column:
+                _put_uvarint(out, _zigzag(n))
+        if version == 1:
+            # v1 stores float64 physical values, the format before the experiment
+            out += struct.pack(f"<{len(run)}d", *(unquantise(channel, row[VALUE]) for row in run))
+    return bytes(out)
+
+def _get_zigzags(raw: bytes, pos: int, n: int) -> tuple[list[int], int]:
+    numbers = []
+    for _ in range(n):
+        z, pos = _get_uvarint(raw, pos)
+        numbers.append(_unzigzag(z))
+    return numbers, pos
 
 def _decode_block(raw: bytes, station: int, version: int, key: str) -> list[Row]:
-    raise NotImplementedError
+    rows = []
+    pos = 0
+    while pos < len(raw):
+        channel, pos = _get_uvarint(raw, pos)
+        n, pos = _get_uvarint(raw, pos)
+        columns = []
+        for _ in range(4 if version == 1 else 5):
+            column, pos = _get_zigzags(raw, pos, n)
+            columns.append(column)
+        dod = columns[0]
+        times = _undeltas(dod[:1] + _undeltas(dod[1:]))
+        others = [_undeltas(column) for column in columns[1:]]
+        if version == 1:
+            floats = struct.unpack_from(f"<{n}d", raw, pos)
+            pos += 8 * n
+            try:
+                others.append([quantise(channel, value) for value in floats])
+            except ValueError as error:
+                raise UnsupportedFormat(f"{key}: v1 {error}") from None
+        rows += zip([station] * n, [channel] * n, times, *others)
+    return rows
 
 def encode_segment(rows: Iterable[Row], shard: int, day: int,
                    version: int = SEGMENT_VERSION) -> tuple[bytes, int]:
     """Sorted rows of one (shard, day) partition to (segment bytes, row count), decoding nothing
     and holding one station's rows at a time."""
-    raise NotImplementedError
+    header = SEGMENT_HEADER.pack(SEGMENT_MAGIC, version, shard, day, len(CHANNELS))
+    if version >= 2:
+        header += struct.pack(f"<{len(STEPS)}I", *STEPS)
+    out = bytearray(header)
+    index = bytearray()
+    count = 0
+    for station, block_rows in itertools.groupby(rows, key=itemgetter(STATION)):
+        block_rows = list(block_rows)
+        block = zlib.compress(_encode_block(block_rows, version), ZLIB_LEVEL)
+        index += INDEX_ENTRY.pack(station, len(out), len(block))
+        out += block
+        count += len(block_rows)
+    n_stations = len(index) // INDEX_ENTRY.size
+    footer = FOOTER.pack(len(header), len(out), n_stations, zlib.crc32(header + index),
+                         FOOTER_MAGIC)
+    return bytes(out + index + footer), count
 
 class Segment:
     """One segment read through ranged gets: footer, header and index at open, then one station
@@ -113,15 +217,63 @@ class Segment:
     def __init__(self, store: ObjectStore, key: str, size: int) -> None:
         """Fetch the footer, then header and index. Check footer magic, meta CRC, header magic,
         version, then steps."""
-        raise NotImplementedError
+        self.store = store
+        self.key = key
+        # size comes from the manifest, so a truncated object has no footer where we look
+        footer = self._fetch(max(size - FOOTER.size, 0), FOOTER.size)
+        if len(footer) != FOOTER.size or footer[-4:] != FOOTER_MAGIC:
+            raise CorruptObject(f"{key}: no footer in the last {FOOTER.size} of {size} bytes, "
+                                "the object is truncated or damaged")
+        self.header_len, index_offset, n_stations, meta_crc, _ = FOOTER.unpack(footer)
+        header = self._fetch(0, self.header_len)
+        index = self._fetch(index_offset, INDEX_ENTRY.size * n_stations)
+        if len(header) != self.header_len or len(index) != INDEX_ENTRY.size * n_stations:
+            raise CorruptObject(f"{key}: header or index is shorter than the footer says")
+        if zlib.crc32(header + index) != meta_crc:
+            raise CorruptObject(f"{key}: header and index CRC mismatch")
+        magic, self.version, self.shard, self.day, n_channels = SEGMENT_HEADER.unpack_from(header)
+        if magic != SEGMENT_MAGIC:
+            raise CorruptObject(f"{key}: bad segment magic {magic!r}")
+        if self.version not in SEGMENT_READ_VERSIONS:
+            raise UnsupportedFormat(f"{key}: segment version {self.version} is not readable")
+        if n_channels > len(CHANNELS):
+            raise UnsupportedFormat(f"{key}: {n_channels} channels, more than this reader knows")
+        if self.version >= 2:
+            self._check_steps(struct.unpack_from(f"<{n_channels}I", header, SEGMENT_HEADER.size))
+        self.index = {station: (offset, length)
+                      for station, offset, length in INDEX_ENTRY.iter_unpack(index)}
+
+    def _check_steps(self, steps: tuple[int, ...]) -> None:
+        # rescaling an older, coarser step exactly is not built, so a changed step is refused
+        for channel, step in enumerate(steps):
+            if step != STEPS[channel]:
+                raise UnsupportedFormat(f"{self.key}: channel {channel} has step {step} in the "
+                                        f"header but {STEPS[channel]} in today's table")
+
+    def _fetch(self, start: int, length: int) -> bytes:
+        try:
+            return self.store.get_range(self.key, start, length)
+        except KeyError:
+            raise CorruptObject(f"{self.key}: listed in the manifest but missing") from None
 
     def _read_block(self, offset: int, length: int) -> bytes:
-        raise NotImplementedError
+        raw = self._fetch(offset, length)
+        if len(raw) != length:
+            raise CorruptObject(f"{self.key}: block at {offset} is {len(raw)} of {length} bytes")
+        try:
+            # zlib checks the stream's own Adler-32, so there is no separate CRC per block
+            return zlib.decompress(raw)
+        except zlib.error as error:
+            raise CorruptObject(f"{self.key}: block at {offset} failed zlib: {error}") from None
 
     def rows(self, station: int) -> list[Row]:
         """Fetch and decode only this station's block. [] if the station is absent."""
-        raise NotImplementedError
+        if station not in self.index:
+            return []
+        offset, length = self.index[station]
+        return _decode_block(self._read_block(offset, length), station, self.version, self.key)
 
     def iter_rows(self) -> Iterator[Row]:
         """Every row in storage order, one decoded block in memory at a time."""
-        raise NotImplementedError
+        for station in self.index:
+            yield from self.rows(station)

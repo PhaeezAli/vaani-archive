@@ -22,13 +22,14 @@ DAY_S, HOUR_S = 86_400, 3_600     # seconds in a UTC day and in an hour
 SOLAR_HOURS = range(6, 20)        # solar stations send nothing from 20:00 to 06:00 UTC
 PHASE_HOUR = 9                    # the daily wave rises through its mean at 09:00 UTC
 PRESSURE = 2                      # the one channel whose profile every group shares
-# (base, daily swing) in steps, per channel and group. Pressure gets a per-station offset on top.
+PRESSURE_SWING = 150              # each station's daily pressure swing is at most this many steps
+# (base, daily swing) in steps, per channel and group. Each group is extreme on some channel.
 PROFILES = (
     {"coastal": (150, 30), "inland": (120, 90), "solar": (200, 60)},
-    {"coastal": (85, 0), "inland": (50, 15), "solar": (30, 0)},
+    {"coastal": (85, 0), "inland": (20, 15), "solar": (50, 0)},
     {"coastal": (10130, 0), "inland": (10130, 0), "solar": (10130, 0)},
-    {"coastal": (60, 0), "inland": (25, 0), "solar": (15, 0)},
-    {"coastal": (10, 0), "inland": (5, 0), "solar": (0, 0)})
+    {"coastal": (60, 0), "inland": (5, 0), "solar": (30, 0)},
+    {"coastal": (10, 0), "inland": (0, 0), "solar": (5, 0)})
 SHUFFLE_WINDOW_S = 3 * HOUR_S     # arrivals are shuffled inside 3-hour windows
 LATE_PERCENT = 5                  # readings moved to the very end, like a station after an outage
 CORRECTION_PERCENT = 3            # readings sent again at revision 1
@@ -44,12 +45,14 @@ def group_of(station: int) -> str:
 def _profile(station: int, channel: int, t: int) -> float:
     base, swing = PROFILES[channel][group_of(station)]
     wave = math.sin(2 * math.pi * ((t % DAY_S) / HOUR_S - PHASE_HOUR) / 24)
-    offset = zlib.crc32(station.to_bytes(4, "big")) % 301 - 150 if channel == PRESSURE else 0
-    return base + swing * wave + offset
+    if channel == PRESSURE:
+        # a swing, not an offset, so that a raw cosine without z-scoring picks wrong neighbours
+        swing = zlib.crc32(station.to_bytes(4, "big")) % (2 * PRESSURE_SWING + 1) - PRESSURE_SWING
+    return base + swing * wave
 
 def value_steps(station: int, channel: int, t: int, revision: int) -> int:
     """A reading's value in steps, a pure function of (key, revision): the group's daily profile, a
-    per-station pressure offset, small hash noise, plus 7 per revision."""
+    per-station pressure swing, small hash noise, plus 7 per revision."""
     noise = zlib.crc32(f"{station}:{channel}:{t}".encode()) % 5 - 2
     return round(_profile(station, channel, t)) + noise + 7 * revision
 
