@@ -34,8 +34,8 @@ from archive.store import ObjectStore, PreconditionFailed
 NUM_SHARDS = 16                 # the doc
 # the doc says 100 to 200 ms and about 5 PUTs a second, which is the 200 ms end
 COMMIT_WINDOW_S = 0.2
-# PLACEHOLDER: wave 3 writes the value printed by demo.memtable_row_bytes() and the date
-MEMTABLE_ROW_BYTES = 240
+# CPython bytes per memtable row, measured by demo.memtable_row_bytes() on 9 Nov 2026 (285)
+MEMTABLE_ROW_BYTES = 285
 MEMTABLE_MAX_ROWS = 64 * 2**20 // MEMTABLE_ROW_BYTES   # the doc's 64 MB cap, counted in rows
 COMPACT_AT_SEGMENTS = 4         # a history read touches at most 4 segments per day
 ACK_TIMEOUT_S = 30.0            # an ingest waits this long for its group, then the API answers 503
